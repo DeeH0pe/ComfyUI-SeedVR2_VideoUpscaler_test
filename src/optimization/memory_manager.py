@@ -1368,7 +1368,6 @@ def complete_cleanup(runner: Any, debug: Optional['Debug'] = None, dit_cache: bo
         runner._vae_model_name = None
     
     # 4. Final memory cleanup
-    synchronize_visible_accelerators(debug=debug, reason="before final allocator cleanup")
     clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
     
     # 5. Clear cuBLAS workspaces

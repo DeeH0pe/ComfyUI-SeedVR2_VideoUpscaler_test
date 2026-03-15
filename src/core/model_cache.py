@@ -3,6 +3,7 @@ Global Model Cache for SeedVR2
 Enables independent DiT and VAE model sharing across multiple upscaler node instances
 """
 
+import threading
 from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
 from ..optimization.memory_manager import release_model_memory
 
@@ -24,6 +25,8 @@ class GlobalModelCache:
         self._vae_models: Dict[str, Tuple[Any, Dict]] = {}
         # Storage for runner templates: "dit_id+vae_id" -> runner
         self._runner_templates: Dict[str, Any] = {}
+        # Synchronizes runner-template claim/set/remove operations
+        self._runner_templates_lock = threading.RLock()
     
     def get_dit(self, dit_config: Dict[str, Any], debug: Optional['Debug'] = None) -> Optional[Any]:
         """
@@ -82,9 +85,44 @@ class GlobalModelCache:
             return None
             
         runner_key = f"{dit_id}+{vae_id}"
-        if runner_key in self._runner_templates:
-            return self._runner_templates[runner_key]
-        return None
+        with self._runner_templates_lock:
+            return self._runner_templates.get(runner_key)
+
+    def claim_runner(self, dit_id: Optional[int], vae_id: Optional[int],
+                     dit_model: str, vae_model: str) -> Tuple[Optional[Any], str]:
+        """
+        Atomically inspect and claim a cached runner template for exclusive reuse.
+
+        Returns:
+            (template, status) where status is one of:
+            - "missing": no cached template exists
+            - "active": template exists but is already in use
+            - "tainted": template exists but was marked failed/interrupted
+            - "mismatch": template exists but was built for different DiT/VAE names
+            - "claimed": template was successfully claimed for reuse
+        """
+        if dit_id is None or vae_id is None:
+            return None, "missing"
+
+        runner_key = f"{dit_id}+{vae_id}"
+        with self._runner_templates_lock:
+            template = self._runner_templates.get(runner_key)
+            if template is None:
+                return None, "missing"
+
+            if getattr(template, '_seedvr2_execution_active', False):
+                return template, "active"
+
+            if getattr(template, '_seedvr2_runner_tainted', False):
+                return template, "tainted"
+
+            current_dit = getattr(template, '_dit_model_name', None)
+            current_vae = getattr(template, '_vae_model_name', None)
+            if current_dit != dit_model or current_vae != vae_model:
+                return template, "mismatch"
+
+            setattr(template, '_seedvr2_execution_active', True)
+            return template, "claimed"
     
     def set_dit(self, dit_config: Dict[str, Any], model: Any, model_name: str, debug: Optional['Debug'] = None) -> Optional[str]:
         """
@@ -155,20 +193,21 @@ class GlobalModelCache:
             return None
             
         runner_key = f"{dit_id}+{vae_id}"
-        existing = self._runner_templates.get(runner_key)
-        if existing is runner:
-            return runner_key
+        with self._runner_templates_lock:
+            existing = self._runner_templates.get(runner_key)
+            if existing is runner:
+                return runner_key
 
-        replace_existing = False
-        if existing is not None:
-            replace_existing = getattr(existing, '_seedvr2_runner_tainted', False)
+            replace_existing = False
+            if existing is not None:
+                replace_existing = getattr(existing, '_seedvr2_runner_tainted', False)
 
-        if existing is None or replace_existing:
-            self._runner_templates[runner_key] = runner
-            if debug:
-                action = "replaced" if replace_existing else "cached"
-                debug.log(f"Runner template {action} in memory: nodes {runner_key}", category="cache", force=True)
-            return runner_key
+            if existing is None or replace_existing:
+                self._runner_templates[runner_key] = runner
+                if debug:
+                    action = "replaced" if replace_existing else "cached"
+                    debug.log(f"Runner template {action} in memory: nodes {runner_key}", category="cache", force=True)
+                return runner_key
         
         return None
 
@@ -183,22 +222,23 @@ class GlobalModelCache:
         if dit_id is None or vae_id is None:
             return False
 
-        runner_key = f"{dit_id}+{vae_id}"
-        cached_runner = self._runner_templates.get(runner_key)
-        if cached_runner is None:
-            return False
+        with self._runner_templates_lock:
+            runner_key = f"{dit_id}+{vae_id}"
+            cached_runner = self._runner_templates.get(runner_key)
+            if cached_runner is None:
+                return False
 
-        if expected_runner is not None and cached_runner is not expected_runner:
-            if debug:
-                debug.log(
-                    f"Skipped cached runner removal for nodes {runner_key}: cache entry no longer matches expected runner",
-                    level="WARNING",
-                    category="cache",
-                    force=True,
-                )
-            return False
+            if expected_runner is not None and cached_runner is not expected_runner:
+                if debug:
+                    debug.log(
+                        f"Skipped cached runner removal for nodes {runner_key}: cache entry no longer matches expected runner",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
 
-        del self._runner_templates[runner_key]
+            del self._runner_templates[runner_key]
         if debug:
             debug.log(f"Removed cached runner template: nodes {runner_key}", category="cache", force=True)
         return True
@@ -231,9 +271,10 @@ class GlobalModelCache:
             del self._dit_models[node_id]
             
             # Remove any runner templates that used this DiT
-            templates_to_remove = [k for k in self._runner_templates.keys() if k.startswith(str(node_id) + "+")]
-            for template_key in templates_to_remove:
-                del self._runner_templates[template_key]         
+            with self._runner_templates_lock:
+                templates_to_remove = [k for k in self._runner_templates.keys() if k.startswith(str(node_id) + "+")]
+                for template_key in templates_to_remove:
+                    del self._runner_templates[template_key]
             
             return True
         return False
@@ -266,9 +307,10 @@ class GlobalModelCache:
             del self._vae_models[node_id]
             
             # Remove any runner templates that used this VAE
-            templates_to_remove = [k for k in self._runner_templates.keys() if k.endswith("+" + str(node_id))]
-            for template_key in templates_to_remove:
-                del self._runner_templates[template_key]
+            with self._runner_templates_lock:
+                templates_to_remove = [k for k in self._runner_templates.keys() if k.endswith("+" + str(node_id))]
+                for template_key in templates_to_remove:
+                    del self._runner_templates[template_key]
             
             return True
         return False
