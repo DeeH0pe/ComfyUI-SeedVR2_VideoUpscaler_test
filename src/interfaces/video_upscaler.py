@@ -614,6 +614,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         cache_context.get('dit_id'),
                         cache_context.get('vae_id'),
                         debug,
+                        expected_runner=runner,
                     )
                 except Exception as cache_error:
                     if debug is not None:

@@ -71,6 +71,48 @@ def synchronize_device(device: Optional[Union[torch.device, str]],
     return False
 
 
+def _iter_runtime_tensors(value: Any):
+    """Yield tensors stored in ad-hoc runtime containers like module.memory."""
+    stack = [value]
+    seen = set()
+
+    while stack:
+        current = stack.pop()
+
+        if torch.is_tensor(current):
+            yield current
+            continue
+
+        if isinstance(current, dict):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            stack.extend(current.values())
+            continue
+
+        if isinstance(current, (list, tuple, set, frozenset)):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            stack.extend(current)
+            continue
+
+
+def _clear_runtime_memory_attr(module: Any) -> int:
+    """Drop a module.memory attribute when it contains runtime tensors."""
+    if not hasattr(module, 'memory'):
+        return 0
+
+    tensor_count = sum(1 for _ in _iter_runtime_tensors(getattr(module, 'memory', None)))
+    if tensor_count <= 0:
+        return 0
+
+    module.memory = None
+    return tensor_count
+
+
 def synchronize_model(model: Optional[torch.nn.Module],
                       debug: Optional['Debug'] = None,
                       reason: Optional[str] = None) -> int:
@@ -80,12 +122,25 @@ def synchronize_model(model: Optional[torch.nn.Module],
 
     devices = set()
     try:
-        for tensor in list(model.parameters()) + list(model.buffers()):
+        for tensor in model.parameters():
             if tensor is None or not torch.is_tensor(tensor):
                 continue
             device = tensor.device
             if device.type not in ('cpu', 'meta'):
                 devices.add(str(device))
+
+        for tensor in model.buffers():
+            if tensor is None or not torch.is_tensor(tensor):
+                continue
+            device = tensor.device
+            if device.type not in ('cpu', 'meta'):
+                devices.add(str(device))
+
+        for module in model.modules():
+            for tensor in _iter_runtime_tensors(getattr(module, 'memory', None)):
+                device = tensor.device
+                if device.type not in ('cpu', 'meta'):
+                    devices.add(str(device))
     except Exception as e:
         if debug:
             why = f" ({reason})" if reason else ""
@@ -651,14 +706,17 @@ def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debu
         model.zero_grad(set_to_none=True)
 
         cleared_memory_buffers = 0
+        cleared_runtime_tensors = 0
         for module in model.modules():
-            if hasattr(module, 'memory') and torch.is_tensor(getattr(module, 'memory')):
-                module.memory = None
+            cleared_tensors = _clear_runtime_memory_attr(module)
+            if cleared_tensors > 0:
                 cleared_memory_buffers += 1
+                cleared_runtime_tensors += cleared_tensors
 
         if debug:
             debug.log(
-                f"Released model references and cleared {cleared_memory_buffers} runtime memory buffers",
+                f"Released model references and cleared {cleared_memory_buffers} runtime memory buffers "
+                f"({cleared_runtime_tensors} tensors)",
                 category="success",
             )
                 
@@ -1006,13 +1064,17 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     # Clear VAE memory buffers when moving to CPU
     if target_type == 'cpu' and model_name == "VAE":
         cleared_count = 0
+        cleared_tensor_count = 0
         for module in model.modules():
-            if hasattr(module, 'memory') and module.memory is not None:
-                if torch.is_tensor(module.memory) and (module.memory.is_cuda or module.memory.is_mps):
-                    module.memory = None
-                    cleared_count += 1
+            cleared_tensors = _clear_runtime_memory_attr(module)
+            if cleared_tensors > 0:
+                cleared_count += 1
+                cleared_tensor_count += cleared_tensors
         if cleared_count > 0 and debug:
-            debug.log(f"Cleared {cleared_count} VAE memory buffers", category="success")
+            debug.log(
+                f"Cleared {cleared_count} VAE memory buffers ({cleared_tensor_count} tensors)",
+                category="success",
+            )
     
     # End timer
     if debug:

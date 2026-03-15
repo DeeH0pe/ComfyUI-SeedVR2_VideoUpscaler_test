@@ -673,7 +673,12 @@ def _acquire_runner(
                 category="cache",
                 force=True,
             )
-            cache_context['global_cache'].remove_runner(cache_context['dit_id'], cache_context['vae_id'], debug)
+            cache_context['global_cache'].remove_runner(
+                cache_context['dit_id'],
+                cache_context['vae_id'],
+                debug,
+                expected_runner=template,
+            )
             return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
 
         if getattr(template, '_seedvr2_runner_tainted', False):
@@ -683,7 +688,12 @@ def _acquire_runner(
                 category="cache",
                 force=True,
             )
-            cache_context['global_cache'].remove_runner(cache_context['dit_id'], cache_context['vae_id'], debug)
+            cache_context['global_cache'].remove_runner(
+                cache_context['dit_id'],
+                cache_context['vae_id'],
+                debug,
+                expected_runner=template,
+            )
             return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
 
         # We have a template - check if we can use it
@@ -708,6 +718,7 @@ def _acquire_runner(
                 cache_context['dit_id'],
                 cache_context['vae_id'],
                 debug,
+                expected_runner=template,
             )
             return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
     else:
@@ -1508,5 +1519,4 @@ def _propagate_debug_to_modules(module: torch.nn.Module, debug: 'Debug') -> None
     
     for name, submodule in module.named_modules():
         if submodule.__class__.__name__ in target_modules:
-            if not hasattr(submodule, 'debug'):  # Only set if not already present
-                submodule.debug = debug
+            submodule.debug = debug

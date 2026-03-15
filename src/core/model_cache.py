@@ -173,18 +173,35 @@ class GlobalModelCache:
         return None
 
     def remove_runner(self, dit_id: Optional[int], vae_id: Optional[int],
-                      debug: Optional['Debug'] = None) -> bool:
-        """Remove a cached runner template for the given DiT/VAE node pair."""
+                      debug: Optional['Debug'] = None,
+                      expected_runner: Optional[Any] = None) -> bool:
+        """Remove a cached runner template for the given DiT/VAE node pair.
+
+        If expected_runner is provided, only remove the cache entry when the
+        currently stored runner is that exact object.
+        """
         if dit_id is None or vae_id is None:
             return False
 
         runner_key = f"{dit_id}+{vae_id}"
-        if runner_key in self._runner_templates:
-            del self._runner_templates[runner_key]
+        cached_runner = self._runner_templates.get(runner_key)
+        if cached_runner is None:
+            return False
+
+        if expected_runner is not None and cached_runner is not expected_runner:
             if debug:
-                debug.log(f"Removed cached runner template: nodes {runner_key}", category="cache", force=True)
-            return True
-        return False
+                debug.log(
+                    f"Skipped cached runner removal for nodes {runner_key}: cache entry no longer matches expected runner",
+                    level="WARNING",
+                    category="cache",
+                    force=True,
+                )
+            return False
+
+        del self._runner_templates[runner_key]
+        if debug:
+            debug.log(f"Removed cached runner template: nodes {runner_key}", category="cache", force=True)
+        return True
     
     def remove_dit(self, dit_config: Dict[str, Any], debug: Optional['Debug'] = None) -> bool:
         """
