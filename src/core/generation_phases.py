@@ -47,6 +47,7 @@ from ..optimization.memory_manager import (
     cleanup_dit,
     cleanup_vae,
     cleanup_text_embeddings,
+    is_model_cache_cold,
     manage_tensor,
     manage_model_device,
     release_tensor_memory,
@@ -294,12 +295,20 @@ def encode_all_batches(
     encode_idx = 0
     
     try:
+        vae_needs_reactivation = runner.vae is not None and is_model_cache_cold(runner.vae)
+
         # Materialize VAE if still on meta device
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
             materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
         else:
+            # Cold cached models keep weights/config, but execution state is rebuilt each run.
+            if vae_needs_reactivation:
+                debug.log("Rebuilding VAE execution state from cold cache", category="vae", force=True)
+                manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
+                                  model_name="VAE", debug=debug, reason="cold-cache activation", runner=runner)
+                apply_model_specific_config(runner.vae, runner, runner.config, False, debug)
             # Model already materialized (cached) - apply any pending configs if needed
-            if getattr(runner, '_vae_config_needs_application', False):
+            elif getattr(runner, '_vae_config_needs_application', False):
                 debug.log("Applying updated VAE configuration", category="vae", force=True)
                 apply_model_specific_config(runner.vae, runner, runner.config, False, debug)
         
@@ -616,12 +625,20 @@ def upscale_all_batches(
     upscale_idx = 0
     
     try:
+        dit_needs_reactivation = runner.dit is not None and is_model_cache_cold(runner.dit)
+
         # Materialize DiT if still on meta device
         if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
             materialize_model(runner, "dit", ctx['dit_device'], runner.config, debug)
         else:
+            # Cold cached models keep weights/config, but execution state is rebuilt each run.
+            if dit_needs_reactivation:
+                debug.log("Rebuilding DiT execution state from cold cache", category="dit", force=True)
+                manage_model_device(model=runner.dit, target_device=ctx['dit_device'],
+                                    model_name="DiT", debug=debug, reason="cold-cache activation", runner=runner)
+                apply_model_specific_config(runner.dit, runner, runner.config, True, debug)
             # Model already materialized (cached) - apply any pending configs if needed
-            if getattr(runner, '_dit_config_needs_application', False):
+            elif getattr(runner, '_dit_config_needs_application', False):
                 debug.log("Applying updated DiT configuration", category="dit", force=True)
                 apply_model_specific_config(runner.dit, runner, runner.config, True, debug)
     

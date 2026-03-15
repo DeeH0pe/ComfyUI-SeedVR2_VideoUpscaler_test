@@ -725,6 +725,119 @@ def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debu
             debug.log(f"Failed to release model memory: {e}", level="WARNING", category="memory", force=True)
 
 
+def iter_model_wrapper_chain(model: Optional[torch.nn.Module]):
+    """Yield a model plus any known wrappers/base modules reachable through unwrap attributes."""
+    if model is None:
+        return
+
+    stack = [model]
+    seen = set()
+
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+
+        obj_id = id(current)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        yield current
+
+        for attr in ('_orig_mod', 'dit_model'):
+            child = getattr(current, attr, None)
+            if child is not None:
+                stack.append(child)
+
+
+def set_model_cache_cold_state(model: Optional[torch.nn.Module], is_cold: bool) -> None:
+    """Mark a cached model and all known wrappers/base objects as cold or hot."""
+    for wrapped_model in iter_model_wrapper_chain(model):
+        setattr(wrapped_model, '_seedvr2_cold_cache', is_cold)
+
+
+def set_model_cache_claimed_state(model: Optional[torch.nn.Module], is_claimed: bool) -> None:
+    """Mark a cached model and all known wrappers/base objects as claimed or free."""
+    for wrapped_model in iter_model_wrapper_chain(model):
+        setattr(wrapped_model, '_seedvr2_cache_claimed', is_claimed)
+
+
+def is_model_cache_cold(model: Optional[torch.nn.Module]) -> bool:
+    """Return True when a cached model is in its cold reusable canonical form."""
+    return any(getattr(wrapped_model, '_seedvr2_cold_cache', False) for wrapped_model in iter_model_wrapper_chain(model))
+
+
+def is_model_cache_claimed(model: Optional[torch.nn.Module]) -> bool:
+    """Return True when a cached model is already leased to an in-flight execution."""
+    return any(getattr(wrapped_model, '_seedvr2_cache_claimed', False) for wrapped_model in iter_model_wrapper_chain(model))
+
+
+def _copy_model_cache_metadata(source: Any, target: Any, attrs: Tuple[str, ...]) -> None:
+    """Preserve cache metadata when normalizing wrapped models back to their base form."""
+    for attr in attrs:
+        if hasattr(source, attr):
+            setattr(target, attr, getattr(source, attr))
+
+
+def _normalize_cached_dit_model(model: torch.nn.Module, debug: Optional['Debug'] = None) -> torch.nn.Module:
+    """Return a cold canonical DiT model with compile/wrapper state removed."""
+    while True:
+        changed = False
+
+        if hasattr(model, '_orig_mod'):
+            if debug:
+                debug.log("Removing torch.compile wrapper from DiT for cold cache storage", category="cleanup")
+            base_model = model._orig_mod
+            _copy_model_cache_metadata(
+                model,
+                base_model,
+                ('_model_name', '_config_compile', '_config_swap', '_config_attn'),
+            )
+            model = base_model
+            changed = True
+
+        if hasattr(model, 'dit_model'):
+            if debug:
+                debug.log("Removing DiT compatibility wrapper for cold cache storage", category="cleanup")
+            base_model = model.dit_model
+            _copy_model_cache_metadata(
+                model,
+                base_model,
+                ('_model_name', '_config_compile', '_config_swap', '_config_attn'),
+            )
+            model = base_model
+            changed = True
+
+        if not changed:
+            break
+
+    release_model_memory(model=model, debug=debug)
+    set_model_cache_cold_state(model, True)
+    return model
+
+
+def _normalize_cached_vae_model(model: torch.nn.Module, debug: Optional['Debug'] = None) -> torch.nn.Module:
+    """Return a cold canonical VAE model with compiled submodules removed."""
+    if hasattr(model, 'encoder') and hasattr(model.encoder, '_orig_mod'):
+        if debug:
+            debug.log("Removing torch.compile wrapper from VAE encoder for cold cache storage", category="cleanup")
+        model.encoder = model.encoder._orig_mod
+
+    if hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod'):
+        if debug:
+            debug.log("Removing torch.compile wrapper from VAE decoder for cold cache storage", category="cleanup")
+        model.decoder = model.decoder._orig_mod
+
+    if hasattr(model, 'debug'):
+        model.debug = None
+    if hasattr(model, 'tensor_offload_device'):
+        model.tensor_offload_device = None
+
+    release_model_memory(model=model, debug=debug)
+    set_model_cache_cold_state(model, True)
+    return model
+
+
 def manage_tensor(
     tensor: torch.Tensor,
     target_device: torch.device,
@@ -838,17 +951,21 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
     if runner and model_name == "DiT":
         # Import here to avoid circular dependency
         from .blockswap import is_blockswap_enabled
+        actual_model = getattr(model, "dit_model", model)
         # Check if BlockSwap config exists and is enabled
         has_blockswap_config = (
             hasattr(runner, '_dit_block_swap_config') and 
             is_blockswap_enabled(runner._dit_block_swap_config)
         )
+        has_blockswap_runtime_state = (
+            getattr(runner, '_blockswap_active', False) or
+            hasattr(actual_model, '_block_swap_config') or
+            hasattr(actual_model, '_original_to') or
+            getattr(actual_model, '_blockswap_bypass_protection', False)
+        )
         
-        if has_blockswap_config:
+        if has_blockswap_config and has_blockswap_runtime_state:
             is_blockswap_model = True
-            # Get the actual model (handle CompatibleDiT wrapper)
-            if hasattr(model, "dit_model"):
-                actual_model = model.dit_model
 
     # Get current device
     try:
@@ -1211,10 +1328,14 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                 if debug:
                     debug.log("DiT on MPS - skipping CPU movement before deletion", category="cleanup")
             else:
-                offload_target = getattr(runner, '_dit_offload_device', None)
-                if offload_target is None or offload_target == 'none':
+                if cache_model:
                     offload_target = torch.device('cpu')
-                reason = "model caching" if cache_model else "releasing GPU memory"
+                    reason = "cold-cache normalization"
+                else:
+                    offload_target = getattr(runner, '_dit_offload_device', None)
+                    if offload_target is None or offload_target == 'none':
+                        offload_target = torch.device('cpu')
+                    reason = "releasing GPU memory"
                 manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT", 
                                    debug=debug, reason=reason, runner=runner)
         elif param_device.type == 'meta' and debug:
@@ -1223,10 +1344,25 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
         pass
     
     # 3. Clean BlockSwap after model movement
-    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
+    if runner.dit is not None and (cache_model or getattr(runner, "_blockswap_active", False)):
         # Import here to avoid circular dependency
         from .blockswap import cleanup_blockswap
-        cleanup_blockswap(runner=runner, keep_state_for_cache=cache_model)
+        cleanup_blockswap(runner=runner, keep_state_for_cache=False)
+
+    if cache_model and runner.dit is not None:
+        cached_dit_before_normalization = runner.dit
+        runner.dit = _normalize_cached_dit_model(runner.dit, debug=debug)
+        dit_cache_node_id = getattr(runner, '_dit_cache_node_id', None)
+        if dit_cache_node_id is not None:
+            from ..core.model_cache import get_global_cache
+            get_global_cache().replace_dit(
+                {'node_id': dit_cache_node_id},
+                runner.dit,
+                debug=debug,
+                expected_model=cached_dit_before_normalization,
+            )
+        if debug:
+            debug.log("DiT cache normalized to cold CPU model state", category="cache", force=True)
     
     # 4. Complete cleanup if not caching
     if not cache_model:
@@ -1291,16 +1427,35 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                 if debug:
                     debug.log("VAE on MPS - skipping CPU movement before deletion", category="cleanup")
             else:
-                offload_target = getattr(runner, '_vae_offload_device', None)
-                if offload_target is None or offload_target == 'none':
+                if cache_model:
                     offload_target = torch.device('cpu')
-                reason = "model caching" if cache_model else "releasing GPU memory"
+                    reason = "cold-cache normalization"
+                else:
+                    offload_target = getattr(runner, '_vae_offload_device', None)
+                    if offload_target is None or offload_target == 'none':
+                        offload_target = torch.device('cpu')
+                    reason = "releasing GPU memory"
                 manage_model_device(model=runner.vae, target_device=offload_target, model_name="VAE", 
                                    debug=debug, reason=reason, runner=runner)
         elif param_device.type == 'meta' and debug:
             debug.log("VAE on meta device - keeping structure for cache", category="cleanup")
     except StopIteration:
         pass
+
+    if cache_model and runner.vae is not None:
+        cached_vae_before_normalization = runner.vae
+        runner.vae = _normalize_cached_vae_model(runner.vae, debug=debug)
+        vae_cache_node_id = getattr(runner, '_vae_cache_node_id', None)
+        if vae_cache_node_id is not None:
+            from ..core.model_cache import get_global_cache
+            get_global_cache().replace_vae(
+                {'node_id': vae_cache_node_id},
+                runner.vae,
+                debug=debug,
+                expected_model=cached_vae_before_normalization,
+            )
+        if debug:
+            debug.log("VAE cache normalized to cold CPU model state", category="cache", force=True)
     
     # 3. Complete cleanup if not caching
     if not cache_model:

@@ -130,8 +130,16 @@ from src.core.generation_phases import (
     decode_all_batches, 
     postprocess_all_batches
 )
+from src.core.model_configuration import _evict_claimed_cached_models
 from src.utils.debug import Debug
-from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cuda_available
+from src.optimization.memory_manager import (
+    cleanup_text_embeddings,
+    clear_memory,
+    complete_cleanup,
+    get_gpu_backend,
+    is_cuda_available,
+    set_model_cache_claimed_state,
+)
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
 
@@ -913,103 +921,175 @@ def _process_frames_core(
     dit_id = "cli_dit" if cache_dit else None
     vae_id = "cli_vae" if cache_vae else None
     
-    runner, cache_context = prepare_runner(
-        dit_model=args.dit_model,
-        vae_model=DEFAULT_VAE,
-        model_dir=model_dir,
-        debug=debug,
-        ctx=ctx,
-        dit_cache=cache_dit,
-        vae_cache=cache_vae,
-        dit_id=dit_id,
-        vae_id=vae_id,
-        block_swap_config={
-            'blocks_to_swap': args.blocks_to_swap,
-            'swap_io_components': args.swap_io_components,
-            'offload_device': dit_offload,
-        },
-        encode_tiled=args.vae_encode_tiled,
-        encode_tile_size=(args.vae_encode_tile_size, args.vae_encode_tile_size),
-        encode_tile_overlap=(args.vae_encode_tile_overlap, args.vae_encode_tile_overlap),
-        decode_tiled=args.vae_decode_tiled,
-        decode_tile_size=(args.vae_decode_tile_size, args.vae_decode_tile_size),
-        decode_tile_overlap=(args.vae_decode_tile_overlap, args.vae_decode_tile_overlap),
-        tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
-        attention_mode=args.attention_mode,
-        torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
-    )
-    
-    ctx['cache_context'] = cache_context
-    if runner_cache is not None:
-        runner_cache['runner'] = runner
-    
-    # Preload text embeddings before Phase 1 to avoid sync stall in Phase 2
-    ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
-    debug.log("Loaded text embeddings for DiT", category="dit")
-    
-    # Compute generation info and log start (handles prepending internally)
-    frames_tensor, gen_info = compute_generation_info(
-        ctx=ctx,
-        images=frames_tensor,
-        resolution=args.resolution,
-        max_resolution=args.max_resolution,
-        batch_size=args.batch_size,
-        uniform_batch_size=args.uniform_batch_size,
-        seed=args.seed,
-        prepend_frames=args.prepend_frames,
-        temporal_overlap=args.temporal_overlap,
-        debug=debug
-    )
-    log_generation_start(gen_info, debug)
-    
-    # Phase 1: Encode
-    ctx = encode_all_batches(
-        runner, ctx=ctx, images=frames_tensor,
-        debug=debug, 
-        batch_size=args.batch_size,
-        uniform_batch_size=args.uniform_batch_size,
-        seed=args.seed,
-        progress_callback=None, 
-        temporal_overlap=args.temporal_overlap,
-        resolution=args.resolution,
-        max_resolution=args.max_resolution,
-        input_noise_scale=args.input_noise_scale,
-        color_correction=args.color_correction
-    )
-    
-    # Phase 2: Upscale
-    ctx = upscale_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        seed=args.seed,
-        latent_noise_scale=args.latent_noise_scale,
-        cache_model=cache_dit
-    )
-    
-    # Phase 3: Decode
-    ctx = decode_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        cache_model=cache_vae
-    )
-    
-    # Phase 4: Post-process
-    ctx = postprocess_all_batches(
-        ctx=ctx, debug=debug, progress_callback=None,
-        color_correction=args.color_correction,
-        prepend_frames=0,  # Worker mode handles this in main process
-        temporal_overlap=args.temporal_overlap,
-        batch_size=args.batch_size
-    )
-    
-    result_tensor = ctx['final_video']
-    
-    # Convert to CPU and compatible dtype
-    if result_tensor.is_cuda or result_tensor.is_mps:
-        result_tensor = result_tensor.cpu()
-    if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
-        result_tensor = result_tensor.to(torch.float32)
-    
-    return result_tensor
+    runner = None
+    cache_context = None
+
+    def cleanup(dit_cache_flag: bool = False, vae_cache_flag: bool = False) -> None:
+        nonlocal runner, ctx
+
+        if runner is not None:
+            try:
+                complete_cleanup(
+                    runner=runner,
+                    debug=debug,
+                    dit_cache=dit_cache_flag,
+                    vae_cache=vae_cache_flag,
+                )
+                if dit_cache_flag and getattr(runner, 'dit', None) is not None:
+                    set_model_cache_claimed_state(runner.dit, False)
+                if vae_cache_flag and getattr(runner, 'vae', None) is not None:
+                    set_model_cache_claimed_state(runner.vae, False)
+            finally:
+                runner._seedvr2_execution_active = False
+
+            if not (dit_cache_flag or vae_cache_flag):
+                runner = None
+                if runner_cache is not None:
+                    runner_cache.pop('runner', None)
+
+        if ctx is not None:
+            cleanup_text_embeddings(ctx, debug)
+            if not (dit_cache_flag or vae_cache_flag):
+                ctx = None
+                if runner_cache is not None:
+                    runner_cache.pop('ctx', None)
+
+    try:
+        runner, cache_context = prepare_runner(
+            dit_model=args.dit_model,
+            vae_model=DEFAULT_VAE,
+            model_dir=model_dir,
+            debug=debug,
+            ctx=ctx,
+            dit_cache=cache_dit,
+            vae_cache=cache_vae,
+            dit_id=dit_id,
+            vae_id=vae_id,
+            block_swap_config={
+                'blocks_to_swap': args.blocks_to_swap,
+                'swap_io_components': args.swap_io_components,
+                'offload_device': dit_offload,
+            },
+            encode_tiled=args.vae_encode_tiled,
+            encode_tile_size=(args.vae_encode_tile_size, args.vae_encode_tile_size),
+            encode_tile_overlap=(args.vae_encode_tile_overlap, args.vae_encode_tile_overlap),
+            decode_tiled=args.vae_decode_tiled,
+            decode_tile_size=(args.vae_decode_tile_size, args.vae_decode_tile_size),
+            decode_tile_overlap=(args.vae_decode_tile_overlap, args.vae_decode_tile_overlap),
+            tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
+            attention_mode=args.attention_mode,
+            torch_compile_args_dit=torch_compile_args_dit,
+            torch_compile_args_vae=torch_compile_args_vae
+        )
+
+        runner._seedvr2_execution_active = True
+        runner._seedvr2_runner_tainted = False
+
+        if (
+            cache_context is not None
+            and not cache_context.get('reusing_runner', False)
+            and cache_context.get('cached_dit') is not None
+            and cache_context.get('cached_vae') is not None
+        ):
+            cache_context['global_cache'].set_runner(
+                cache_context.get('dit_id'),
+                cache_context.get('vae_id'),
+                runner,
+                debug,
+            )
+
+        ctx['cache_context'] = cache_context
+        if runner_cache is not None:
+            runner_cache['runner'] = runner
+
+        # Preload text embeddings before Phase 1 to avoid sync stall in Phase 2
+        ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
+        debug.log("Loaded text embeddings for DiT", category="dit")
+
+        # Compute generation info and log start (handles prepending internally)
+        frames_tensor, gen_info = compute_generation_info(
+            ctx=ctx,
+            images=frames_tensor,
+            resolution=args.resolution,
+            max_resolution=args.max_resolution,
+            batch_size=args.batch_size,
+            uniform_batch_size=args.uniform_batch_size,
+            seed=args.seed,
+            prepend_frames=args.prepend_frames,
+            temporal_overlap=args.temporal_overlap,
+            debug=debug
+        )
+        log_generation_start(gen_info, debug)
+
+        # Phase 1: Encode
+        ctx = encode_all_batches(
+            runner, ctx=ctx, images=frames_tensor,
+            debug=debug,
+            batch_size=args.batch_size,
+            uniform_batch_size=args.uniform_batch_size,
+            seed=args.seed,
+            progress_callback=None,
+            temporal_overlap=args.temporal_overlap,
+            resolution=args.resolution,
+            max_resolution=args.max_resolution,
+            input_noise_scale=args.input_noise_scale,
+            color_correction=args.color_correction
+        )
+
+        # Phase 2: Upscale
+        ctx = upscale_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=None,
+            seed=args.seed,
+            latent_noise_scale=args.latent_noise_scale,
+            cache_model=cache_dit
+        )
+
+        # Phase 3: Decode
+        ctx = decode_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=None,
+            cache_model=cache_vae
+        )
+
+        # Phase 4: Post-process
+        ctx = postprocess_all_batches(
+            ctx=ctx, debug=debug, progress_callback=None,
+            color_correction=args.color_correction,
+            prepend_frames=0,  # Worker mode handles this in main process
+            temporal_overlap=args.temporal_overlap,
+            batch_size=args.batch_size
+        )
+
+        result_tensor = ctx['final_video']
+
+        # Convert to CPU and compatible dtype
+        if result_tensor.is_cuda or result_tensor.is_mps:
+            result_tensor = result_tensor.cpu()
+        if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+            result_tensor = result_tensor.to(torch.float32)
+
+        cleanup(dit_cache_flag=cache_dit, vae_cache_flag=cache_vae)
+        return result_tensor
+    except BaseException:
+        if runner is not None:
+            runner._seedvr2_runner_tainted = True
+
+        if cache_context is not None:
+            _evict_claimed_cached_models(cache_context, runner, debug)
+            try:
+                cache_context['global_cache'].remove_runner(
+                    cache_context.get('dit_id'),
+                    cache_context.get('vae_id'),
+                    debug,
+                    expected_runner=runner,
+                )
+            except BaseException:
+                pass
+
+        try:
+            cleanup(dit_cache_flag=False, vae_cache_flag=False)
+        except BaseException:
+            pass
+        raise
 
 
 def _worker_process(

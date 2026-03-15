@@ -5,7 +5,14 @@ Enables independent DiT and VAE model sharing across multiple upscaler node inst
 
 import threading
 from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
-from ..optimization.memory_manager import release_model_memory
+from ..optimization.memory_manager import (
+    is_model_cache_claimed,
+    is_model_cache_cold,
+    iter_model_wrapper_chain,
+    release_model_memory,
+    set_model_cache_claimed_state,
+    set_model_cache_cold_state,
+)
 
 if TYPE_CHECKING:
     from ..utils.debug import Debug
@@ -25,8 +32,19 @@ class GlobalModelCache:
         self._vae_models: Dict[str, Tuple[Any, Dict]] = {}
         # Storage for runner templates: "dit_id+vae_id" -> runner
         self._runner_templates: Dict[str, Any] = {}
+        # Synchronizes DiT/VAE model cache claim/set/replace/remove operations
+        self._model_cache_lock = threading.RLock()
         # Synchronizes runner-template claim/set/remove operations
         self._runner_templates_lock = threading.RLock()
+
+    def _models_share_identity(self, cached_model: Any, expected_model: Any) -> bool:
+        """Return True when two model references point into the same wrapper/base chain."""
+        if cached_model is None or expected_model is None:
+            return False
+
+        cached_ids = {id(model) for model in iter_model_wrapper_chain(cached_model)}
+        expected_ids = {id(model) for model in iter_model_wrapper_chain(expected_model)}
+        return bool(cached_ids & expected_ids)
     
     def get_dit(self, dit_config: Dict[str, Any], debug: Optional['Debug'] = None) -> Optional[Any]:
         """
@@ -43,10 +61,38 @@ class GlobalModelCache:
             return None
             
         node_id = dit_config.get('node_id')
-        if node_id in self._dit_models:
-            model, stored_config = self._dit_models[node_id]
-            return model
+        with self._model_cache_lock:
+            if node_id in self._dit_models:
+                model, stored_config = self._dit_models[node_id]
+                if not is_model_cache_cold(model):
+                    if debug:
+                        debug.log(
+                            f"Cached DiT is still hot or incomplete; waiting for cold cache state before reuse (node {node_id})",
+                            category="cache",
+                            force=True,
+                        )
+                    return None
+                if is_model_cache_claimed(model):
+                    if debug:
+                        debug.log(
+                            f"Cached DiT is already claimed by another execution; skipping reuse (node {node_id})",
+                            category="cache",
+                            force=True,
+                        )
+                    return None
+                set_model_cache_claimed_state(model, True)
+                return model
         return None
+
+    def peek_dit(self, dit_config: Dict[str, Any]) -> Optional[Any]:
+        """Return the cached DiT model without claiming it."""
+        node_id = dit_config.get('node_id')
+        if node_id is None:
+            return None
+
+        with self._model_cache_lock:
+            entry = self._dit_models.get(node_id)
+            return None if entry is None else entry[0]
     
     def get_vae(self, vae_config: Dict[str, Any], debug: Optional['Debug'] = None) -> Optional[Any]:
         """
@@ -63,10 +109,38 @@ class GlobalModelCache:
             return None
             
         node_id = vae_config.get('node_id')
-        if node_id in self._vae_models:
-            model, stored_config = self._vae_models[node_id]
-            return model
+        with self._model_cache_lock:
+            if node_id in self._vae_models:
+                model, stored_config = self._vae_models[node_id]
+                if not is_model_cache_cold(model):
+                    if debug:
+                        debug.log(
+                            f"Cached VAE is still hot or incomplete; waiting for cold cache state before reuse (node {node_id})",
+                            category="cache",
+                            force=True,
+                        )
+                    return None
+                if is_model_cache_claimed(model):
+                    if debug:
+                        debug.log(
+                            f"Cached VAE is already claimed by another execution; skipping reuse (node {node_id})",
+                            category="cache",
+                            force=True,
+                        )
+                    return None
+                set_model_cache_claimed_state(model, True)
+                return model
         return None
+
+    def peek_vae(self, vae_config: Dict[str, Any]) -> Optional[Any]:
+        """Return the cached VAE model without claiming it."""
+        node_id = vae_config.get('node_id')
+        if node_id is None:
+            return None
+
+        with self._model_cache_lock:
+            entry = self._vae_models.get(node_id)
+            return None if entry is None else entry[0]
     
     def get_runner(self, dit_id: Optional[int], vae_id: Optional[int],
                         debug: Optional['Debug'] = None) -> Optional[Any]:
@@ -141,7 +215,22 @@ class GlobalModelCache:
             return None
             
         node_id = dit_config.get('node_id')
-        self._dit_models[node_id] = (model, dit_config)
+        with self._model_cache_lock:
+            existing = self._dit_models.get(node_id)
+            if existing is not None:
+                existing_model, _ = existing
+                if not self._models_share_identity(existing_model, model) and is_model_cache_claimed(existing_model):
+                    if debug:
+                        debug.log(
+                            f"Skipped caching DiT model for node {node_id}: cache entry is currently claimed by another execution",
+                            level="WARNING",
+                            category="cache",
+                            force=True,
+                        )
+                    return None
+            set_model_cache_cold_state(model, False)
+            set_model_cache_claimed_state(model, True)
+            self._dit_models[node_id] = (model, dit_config)
         
         if debug:
             debug.log(f"DiT model cached in memory (node {node_id}): {model_name}", 
@@ -166,13 +255,86 @@ class GlobalModelCache:
            return None
             
         node_id = vae_config.get('node_id')
-        self._vae_models[node_id] = (model, vae_config)
+        with self._model_cache_lock:
+            existing = self._vae_models.get(node_id)
+            if existing is not None:
+                existing_model, _ = existing
+                if not self._models_share_identity(existing_model, model) and is_model_cache_claimed(existing_model):
+                    if debug:
+                        debug.log(
+                            f"Skipped caching VAE model for node {node_id}: cache entry is currently claimed by another execution",
+                            level="WARNING",
+                            category="cache",
+                            force=True,
+                        )
+                    return None
+            set_model_cache_cold_state(model, False)
+            set_model_cache_claimed_state(model, True)
+            self._vae_models[node_id] = (model, vae_config)
         
         if debug:
             debug.log(f"VAE model cached in memory (node {node_id}): {model_name}", 
                      category="cache", force=True)
         
         return node_id
+
+    def replace_dit(
+        self,
+        dit_config: Dict[str, Any],
+        model: Any,
+        debug: Optional['Debug'] = None,
+        expected_model: Optional[Any] = None,
+    ) -> bool:
+        """Rewrite a cached DiT entry to a normalized canonical model."""
+        node_id = dit_config.get('node_id')
+        with self._model_cache_lock:
+            if node_id not in self._dit_models:
+                return False
+
+            cached_model, stored_config = self._dit_models[node_id]
+            if expected_model is not None and not self._models_share_identity(cached_model, expected_model):
+                if debug:
+                    debug.log(
+                        f"Skipped cached DiT rewrite for node {node_id}: cache entry no longer matches the claimed model",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+
+            self._dit_models[node_id] = (model, stored_config)
+        if debug:
+            debug.log(f"Rewrote cached DiT entry to cold canonical model (node {node_id})", category="cache", force=True)
+        return True
+
+    def replace_vae(
+        self,
+        vae_config: Dict[str, Any],
+        model: Any,
+        debug: Optional['Debug'] = None,
+        expected_model: Optional[Any] = None,
+    ) -> bool:
+        """Rewrite a cached VAE entry to a normalized canonical model."""
+        node_id = vae_config.get('node_id')
+        with self._model_cache_lock:
+            if node_id not in self._vae_models:
+                return False
+
+            cached_model, stored_config = self._vae_models[node_id]
+            if expected_model is not None and not self._models_share_identity(cached_model, expected_model):
+                if debug:
+                    debug.log(
+                        f"Skipped cached VAE rewrite for node {node_id}: cache entry no longer matches the claimed model",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+
+            self._vae_models[node_id] = (model, stored_config)
+        if debug:
+            debug.log(f"Rewrote cached VAE entry to cold canonical model (node {node_id})", category="cache", force=True)
+        return True
     
     def set_runner(self, dit_id: Optional[int], vae_id: Optional[int],
                     runner: Any, debug: Optional['Debug'] = None) -> Optional[str]:
@@ -244,7 +406,12 @@ class GlobalModelCache:
             debug.log(f"Removed cached runner template: nodes {runner_key}", category="cache", force=True)
         return True
     
-    def remove_dit(self, dit_config: Dict[str, Any], debug: Optional['Debug'] = None) -> bool:
+    def remove_dit(
+        self,
+        dit_config: Dict[str, Any],
+        debug: Optional['Debug'] = None,
+        expected_model: Optional[Any] = None,
+    ) -> bool:
         """
         Remove DiT model from cache if it exists.
         
@@ -259,28 +426,52 @@ class GlobalModelCache:
             Also removes any runner templates that used this DiT model
         """
         node_id = dit_config.get('node_id')
-        if node_id in self._dit_models:
+        with self._model_cache_lock:
+            if node_id not in self._dit_models:
+                return False
+
+            cached_model, stored_config = self._dit_models[node_id]
+            if expected_model is None and is_model_cache_claimed(cached_model):
+                if debug:
+                    debug.log(
+                        f"Skipped cached DiT removal for node {node_id}: cache entry is currently claimed by another execution",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+            if expected_model is not None and not self._models_share_identity(cached_model, expected_model):
+                if debug:
+                    debug.log(
+                        f"Skipped cached DiT removal for node {node_id}: cache entry no longer matches the claimed model",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+
             if debug:
                 debug.log(f"Removing cached DiT: {node_id}", category="cache", force=True)
 
-            model, stored_config = self._dit_models[node_id]
-            
-            # Release model memory
-            if model is not None:
-                release_model_memory(model=model, debug=debug)
-            
+            model = cached_model
             del self._dit_models[node_id]
-            
-            # Remove any runner templates that used this DiT
-            with self._runner_templates_lock:
-                templates_to_remove = [k for k in self._runner_templates.keys() if k.startswith(str(node_id) + "+")]
-                for template_key in templates_to_remove:
-                    del self._runner_templates[template_key]
-            
-            return True
-        return False
+
+        if model is not None:
+            release_model_memory(model=model, debug=debug)
+
+        with self._runner_templates_lock:
+            templates_to_remove = [k for k in self._runner_templates.keys() if k.startswith(str(node_id) + "+")]
+            for template_key in templates_to_remove:
+                del self._runner_templates[template_key]
+
+        return True
     
-    def remove_vae(self, vae_config: Dict[str, Any], debug: Optional['Debug'] = None) -> bool:
+    def remove_vae(
+        self,
+        vae_config: Dict[str, Any],
+        debug: Optional['Debug'] = None,
+        expected_model: Optional[Any] = None,
+    ) -> bool:
         """
         Remove VAE model from cache if it exists.
         
@@ -295,26 +486,45 @@ class GlobalModelCache:
             Also removes any runner templates that used this VAE model
         """
         node_id = vae_config.get('node_id')
-        if node_id in self._vae_models:
+        with self._model_cache_lock:
+            if node_id not in self._vae_models:
+                return False
+
+            cached_model, stored_config = self._vae_models[node_id]
+            if expected_model is None and is_model_cache_claimed(cached_model):
+                if debug:
+                    debug.log(
+                        f"Skipped cached VAE removal for node {node_id}: cache entry is currently claimed by another execution",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+            if expected_model is not None and not self._models_share_identity(cached_model, expected_model):
+                if debug:
+                    debug.log(
+                        f"Skipped cached VAE removal for node {node_id}: cache entry no longer matches the claimed model",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+
             if debug:
                 debug.log(f"Removing cached VAE: {node_id}", category="cache", force=True)
 
-            model, stored_config = self._vae_models[node_id]
-            
-            # Release model memory directly
-            if model is not None:
-                release_model_memory(model=model, debug=debug)
-            
+            model = cached_model
             del self._vae_models[node_id]
-            
-            # Remove any runner templates that used this VAE
-            with self._runner_templates_lock:
-                templates_to_remove = [k for k in self._runner_templates.keys() if k.endswith("+" + str(node_id))]
-                for template_key in templates_to_remove:
-                    del self._runner_templates[template_key]
-            
-            return True
-        return False
+
+        if model is not None:
+            release_model_memory(model=model, debug=debug)
+
+        with self._runner_templates_lock:
+            templates_to_remove = [k for k in self._runner_templates.keys() if k.endswith("+" + str(node_id))]
+            for template_key in templates_to_remove:
+                del self._runner_templates[template_key]
+
+        return True
 
 
 # Global singleton instance

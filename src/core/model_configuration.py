@@ -75,7 +75,13 @@ from ..optimization.compatibility import (
     validate_attention_mode
 )
 from ..optimization.blockswap import is_blockswap_enabled, validate_blockswap_config, apply_block_swap_to_dit, cleanup_blockswap
-from ..optimization.memory_manager import cleanup_dit, cleanup_vae
+from ..optimization.memory_manager import (
+    cleanup_dit,
+    cleanup_vae,
+    is_model_cache_claimed,
+    set_model_cache_claimed_state,
+    set_model_cache_cold_state,
+)
 from ..utils.constants import find_model_file
 
 
@@ -320,7 +326,7 @@ def _update_model_config(
                 elif config_name == 'attention_mode':
                     display_name = 'Attention Mode'
                     
-                config_changes.append(f"{display_name}: {old_desc} → {new_desc}")
+                config_changes.append(f"{display_name}: {old_desc} -> {new_desc}")
     
     # If nothing changed, reuse model as-is
     if not any(changes_detected.values()):
@@ -592,41 +598,89 @@ def _initialize_cache_context(
     # Check for cached DiT model with model name validation
     # Model name validation prevents stale cache when user switches models in UI
     if dit_cache and dit_model and dit_id is not None:
-        cached_model = global_cache.get_dit({'node_id': dit_id, 'cache_model': True}, debug)
-        if cached_model:
+        cached_model = global_cache.peek_dit({'node_id': dit_id})
+        if cached_model is not None:
+            cached_claimed = is_model_cache_claimed(cached_model)
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
             if cached_model_name == dit_model:
                 # Cache hit with valid model - reuse it
-                context['cached_dit'] = cached_model
+                claimed_model = global_cache.get_dit({'node_id': dit_id, 'cache_model': True}, debug)
+                if claimed_model is not None:
+                    claimed_model_name = getattr(claimed_model, '_model_name', None)
+                    if claimed_model_name == dit_model:
+                        context['cached_dit'] = claimed_model
+                    else:
+                        if claimed_model_name:
+                            debug.log(
+                                f"Claimed DiT no longer matches requested model ({claimed_model_name} -> {dit_model}), "
+                                f"evicting claimed cache entry",
+                                category="cache",
+                                force=True,
+                            )
+                        global_cache.remove_dit({'node_id': dit_id}, debug, expected_model=claimed_model)
             else:
                 # Model changed - remove stale cache and log the change
                 if cached_model_name:
-                    debug.log(f"DiT model changed in cache ({cached_model_name} → {dit_model}), "
+                    debug.log(f"DiT model changed in cache ({cached_model_name} -> {dit_model}), "
                              f"removing stale cached model", category="cache", force=True)
-                global_cache.remove_dit({'node_id': dit_id}, debug)
+                if cached_claimed:
+                    debug.log(
+                        f"Cached DiT for node {dit_id} is stale but currently claimed; leaving it in cache until the owning execution releases it",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                else:
+                    global_cache.remove_dit({'node_id': dit_id}, debug)
     else:
         # Caching disabled or no ID - clean up any existing cache for this node
         if dit_id is not None:
-            global_cache.remove_dit({'node_id': dit_id}, debug)
+            cached_model = global_cache.peek_dit({'node_id': dit_id})
+            if cached_model is not None and not is_model_cache_claimed(cached_model):
+                global_cache.remove_dit({'node_id': dit_id}, debug)
 
     # Check for cached VAE model with model name validation
     if vae_cache and vae_model and vae_id is not None:
-        cached_model = global_cache.get_vae({'node_id': vae_id, 'cache_model': True}, debug)
-        if cached_model:
+        cached_model = global_cache.peek_vae({'node_id': vae_id})
+        if cached_model is not None:
+            cached_claimed = is_model_cache_claimed(cached_model)
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
             if cached_model_name == vae_model:
-                context['cached_vae'] = cached_model
+                claimed_model = global_cache.get_vae({'node_id': vae_id, 'cache_model': True}, debug)
+                if claimed_model is not None:
+                    claimed_model_name = getattr(claimed_model, '_model_name', None)
+                    if claimed_model_name == vae_model:
+                        context['cached_vae'] = claimed_model
+                    else:
+                        if claimed_model_name:
+                            debug.log(
+                                f"Claimed VAE no longer matches requested model ({claimed_model_name} -> {vae_model}), "
+                                f"evicting claimed cache entry",
+                                category="cache",
+                                force=True,
+                            )
+                        global_cache.remove_vae({'node_id': vae_id}, debug, expected_model=claimed_model)
             else:
                 # Model changed - remove stale cache and log the change
                 if cached_model_name:
-                    debug.log(f"VAE model changed in cache ({cached_model_name} → {vae_model}), "
+                    debug.log(f"VAE model changed in cache ({cached_model_name} -> {vae_model}), "
                              f"removing stale cached model", category="cache", force=True)
-                global_cache.remove_vae({'node_id': vae_id}, debug)
+                if cached_claimed:
+                    debug.log(
+                        f"Cached VAE for node {vae_id} is stale but currently claimed; leaving it in cache until the owning execution releases it",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                else:
+                    global_cache.remove_vae({'node_id': vae_id}, debug)
     else:
         if vae_id is not None:
-            global_cache.remove_vae({'node_id': vae_id}, debug)
+            cached_model = global_cache.peek_vae({'node_id': vae_id})
+            if cached_model is not None and not is_model_cache_claimed(cached_model):
+                global_cache.remove_vae({'node_id': vae_id}, debug)
     
     return context
 
@@ -734,8 +788,8 @@ def _create_new_runner(
     
     Args:
         dit_model: DiT model filename (determines config selection)
-                  - Contains "7b" → loads configs_7b/main.yaml
-                  - Otherwise → loads configs_3b/main.yaml
+                  - Contains "7b" -> loads configs_7b/main.yaml
+                  - Otherwise -> loads configs_3b/main.yaml
         vae_model: VAE model filename (stored for reference, not used in config selection)
         base_cache_dir: Base directory for model files (not used directly but passed for context)
         debug: Debug instance for logging and timing
@@ -856,6 +910,8 @@ def configure_runner(
         # Phase 3: Configure runner settings
         _configure_runner_settings(
             runner, ctx,
+            cache_context.get('dit_id') if dit_cache else None,
+            cache_context.get('vae_id') if vae_cache else None,
             encode_tiled, encode_tile_size, encode_tile_overlap,
             decode_tiled, decode_tile_size, decode_tile_overlap,
             tile_debug, attention_mode,
@@ -869,6 +925,7 @@ def configure_runner(
             base_cache_dir, block_swap_config, debug
         )
     except BaseException:
+        _evict_claimed_cached_models(cache_context, runner, debug)
         if runner is not None and cache_context.get('reusing_runner', False):
             runner._seedvr2_runner_tainted = True
             runner._seedvr2_execution_active = False
@@ -892,9 +949,41 @@ def configure_runner(
     return runner, cache_context
 
 
+def _evict_claimed_cached_models(
+    cache_context: Dict[str, Any],
+    runner: Optional[VideoDiffusionInfer],
+    debug: Optional['Debug'] = None,
+) -> None:
+    """
+    Evict claimed cached models after activation/setup failure.
+
+    Claimed cached models may be partially materialized or partially reconfigured
+    when an exception interrupts setup. In that case they must be removed from the
+    global cache rather than merely unclaimed.
+    """
+    if not cache_context:
+        return
+
+    global_cache = cache_context.get('global_cache')
+    if global_cache is None:
+        return
+
+    dit_id = cache_context.get('dit_id')
+    if cache_context.get('dit_cache') and dit_id is not None:
+        expected_dit = (getattr(runner, 'dit', None) if runner is not None else None) or cache_context.get('cached_dit')
+        global_cache.remove_dit({'node_id': dit_id}, debug, expected_model=expected_dit)
+
+    vae_id = cache_context.get('vae_id')
+    if cache_context.get('vae_cache') and vae_id is not None:
+        expected_vae = (getattr(runner, 'vae', None) if runner is not None else None) or cache_context.get('cached_vae')
+        global_cache.remove_vae({'node_id': vae_id}, debug, expected_model=expected_vae)
+
+
 def _configure_runner_settings(
     runner: VideoDiffusionInfer,
     ctx: Dict[str, Any],
+    dit_cache_node_id: Optional[int],
+    vae_cache_node_id: Optional[int],
     encode_tiled: bool,
     encode_tile_size: Optional[Tuple[int, int]],
     encode_tile_overlap: Optional[Tuple[int, int]],
@@ -963,6 +1052,8 @@ def _configure_runner_settings(
     runner._vae_offload_device = ctx['vae_offload_device']
     runner._tensor_offload_device = ctx['tensor_offload_device']
     runner._compute_dtype = ctx['compute_dtype']
+    runner._dit_cache_node_id = dit_cache_node_id
+    runner._vae_cache_node_id = vae_cache_node_id
 
     runner.debug = debug
 
@@ -1079,7 +1170,7 @@ def _setup_dit_model(
     current_dit_name = getattr(runner, '_dit_model_name', None)
     if current_dit_name and current_dit_name != dit_model:
         if hasattr(runner, 'dit') and runner.dit is not None:
-            debug.log(f"DiT model changed ({current_dit_name} → {dit_model}), cleaning old model", 
+            debug.log(f"DiT model changed ({current_dit_name} -> {dit_model}), cleaning old model", 
                      category="cache", force=True)
             cleanup_dit(runner=runner, debug=debug, cache_model=False)
     
@@ -1152,7 +1243,7 @@ def _setup_vae_model(
     current_vae_name = getattr(runner, '_vae_model_name', None)
     if current_vae_name and current_vae_name != vae_model:
         if hasattr(runner, 'vae') and runner.vae is not None:
-            debug.log(f"VAE model changed ({current_vae_name} → {vae_model}), cleaning old model", 
+            debug.log(f"VAE model changed ({current_vae_name} -> {vae_model}), cleaning old model", 
                      category="cache", force=True)
             cleanup_vae(runner=runner, debug=debug, cache_model=False)
     
@@ -1336,7 +1427,9 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
         # Clear the config application flag after successful application
         if hasattr(runner, '_vae_config_needs_application'):
             runner._vae_config_needs_application = False
-    
+
+    set_model_cache_cold_state(model, False)
+    set_model_cache_claimed_state(model, True)
     return model
 
 

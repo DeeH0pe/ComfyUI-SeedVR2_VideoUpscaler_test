@@ -23,10 +23,12 @@ from ..core.generation_utils import (
     load_text_embeddings,
     script_directory
 )
+from ..core.model_configuration import _evict_claimed_cached_models
 from ..optimization.memory_manager import (
     cleanup_text_embeddings,
     complete_cleanup,
-    get_device_list
+    get_device_list,
+    set_model_cache_claimed_state,
 )
 
 # Import ComfyUI progress reporting
@@ -327,6 +329,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         dit_cache=dit_cache,
                         vae_cache=vae_cache,
                     )
+                    if dit_cache and getattr(runner, 'dit', None) is not None:
+                        set_model_cache_claimed_state(runner.dit, False)
+                    if vae_cache and getattr(runner, 'vae', None) is not None:
+                        set_model_cache_claimed_state(runner.vae, False)
                 finally:
                     runner._seedvr2_execution_active = False
                 
@@ -609,6 +615,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 runner._seedvr2_runner_tainted = True
 
             if cache_context is not None:
+                _evict_claimed_cached_models(cache_context, runner, debug)
                 try:
                     cache_context['global_cache'].remove_runner(
                         cache_context.get('dit_id'),
@@ -626,7 +633,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         )
 
             try:
-                cleanup(dit_cache=dit_cache, vae_cache=vae_cache)
+                cleanup(dit_cache=False, vae_cache=False)
             except BaseException as cleanup_error:
                 if debug is not None:
                     debug.log(
