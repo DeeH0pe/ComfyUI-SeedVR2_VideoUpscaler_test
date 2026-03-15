@@ -658,26 +658,62 @@ def _acquire_runner(
     Returns:
         VideoDiffusionInfer: Runner instance (cached template or newly created)
     """
-    # Try to get runner template from global cache
-    template = cache_context['global_cache'].get_runner(
-        cache_context['dit_id'], cache_context['vae_id'], debug
+    # Try to atomically claim a reusable runner template from global cache
+    template, template_status = cache_context['global_cache'].claim_runner(
+        cache_context['dit_id'],
+        cache_context['vae_id'],
+        dit_model,
+        vae_model,
     )
     
     if template:
-        # We have a template - check if we can use it
-        current_dit = getattr(template, '_dit_model_name', None)
-        current_vae = getattr(template, '_vae_model_name', None)
-        models_match = (current_dit == dit_model and current_vae == vae_model)
-        
-        if models_match:
-            # Perfect match - reuse template directly
-            runner_key = f"{cache_context['dit_id']}+{cache_context['vae_id']}"
+        runner_key = f"{cache_context['dit_id']}+{cache_context['vae_id']}"
+
+        if template_status == "active":
+            debug.log(
+                f"Cached runner template still marked active: nodes {runner_key}; creating a fresh runner",
+                level="WARNING",
+                category="cache",
+                force=True,
+            )
+            return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
+
+        if template_status == "tainted":
+            debug.log(
+                f"Cached runner template was tainted by a prior failed/interrupted run: nodes {runner_key}; creating a fresh runner",
+                level="WARNING",
+                category="cache",
+                force=True,
+            )
+            cache_context['global_cache'].remove_runner(
+                cache_context['dit_id'],
+                cache_context['vae_id'],
+                debug,
+                expected_runner=template,
+            )
+            return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
+
+        if template_status == "claimed":
             debug.log(f"Reusing cached runner template: nodes {runner_key}", category="reuse", force=True)
             cache_context['reusing_runner'] = True
             return template
-        else:
-            # Template exists but models changed and no cached models - create new
-            return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
+
+        current_dit = getattr(template, '_dit_model_name', None)
+        current_vae = getattr(template, '_vae_model_name', None)
+        debug.log(
+            f"Cached runner template models no longer match: nodes {runner_key} "
+            f"({current_dit}/{current_vae} -> {dit_model}/{vae_model}); creating a fresh runner",
+            level="WARNING",
+            category="cache",
+            force=True,
+        )
+        cache_context['global_cache'].remove_runner(
+            cache_context['dit_id'],
+            cache_context['vae_id'],
+            debug,
+            expected_runner=template,
+        )
+        return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
     else:
         # No template - create new runner
         return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
@@ -1476,5 +1512,4 @@ def _propagate_debug_to_modules(module: torch.nn.Module, debug: 'Debug') -> None
     
     for name, submodule in module.named_modules():
         if submodule.__class__.__name__ in target_modules:
-            if not hasattr(submodule, 'debug'):  # Only set if not already present
-                submodule.debug = debug
+            submodule.debug = debug

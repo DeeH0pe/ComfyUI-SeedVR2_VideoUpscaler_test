@@ -11,13 +11,166 @@ import sys
 import time
 import psutil
 import platform
-from typing import Tuple, Dict, Any, Optional, List, Union
+from typing import Tuple, Dict, Any, Optional, List, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..utils.debug import Debug
 
 
 def _device_str(device: Union[torch.device, str]) -> str:
     """Normalized uppercase device string for comparison and logging. MPS variants → 'MPS'."""
     s = str(device).upper()
     return 'MPS' if s.startswith('MPS') else s
+
+
+def _normalize_device(device: Optional[Union[torch.device, str]]) -> Optional[torch.device]:
+    """Normalize an optional device spec to torch.device."""
+    if device is None:
+        return None
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
+
+def synchronize_device(device: Optional[Union[torch.device, str]],
+                       debug: Optional['Debug'] = None,
+                       reason: Optional[str] = None) -> bool:
+    """Synchronize a single accelerator device before cleanup or device moves."""
+    device = _normalize_device(device)
+    if device is None or device.type in ('cpu', 'meta'):
+        return False
+
+    try:
+        if device.type == 'cuda' and is_cuda_available():
+            if debug:
+                why = f" ({reason})" if reason else ""
+                debug.log(f"Synchronizing {_device_str(device)}{why}", category="cleanup")
+            torch.cuda.synchronize(device)
+            if debug:
+                why = f" ({reason})" if reason else ""
+                debug.log(f"Synchronized {_device_str(device)}{why}", category="cleanup")
+            return True
+        if device.type == 'mps' and is_mps_available():
+            if debug:
+                why = f" ({reason})" if reason else ""
+                debug.log(f"Synchronizing MPS{why}", category="cleanup")
+            torch.mps.synchronize()
+            if debug:
+                why = f" ({reason})" if reason else ""
+                debug.log(f"Synchronized MPS{why}", category="cleanup")
+            return True
+    except Exception as e:
+        if debug:
+            why = f" ({reason})" if reason else ""
+            debug.log(
+                f"Device synchronization failed for {device}{why}: {e}",
+                level="WARNING",
+                category="cleanup",
+                force=True,
+            )
+    return False
+
+
+def _iter_runtime_tensors(value: Any):
+    """Yield tensors stored in ad-hoc runtime containers like module.memory."""
+    stack = [value]
+    seen = set()
+
+    while stack:
+        current = stack.pop()
+
+        if torch.is_tensor(current):
+            yield current
+            continue
+
+        if isinstance(current, dict):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            stack.extend(current.values())
+            continue
+
+        if isinstance(current, (list, tuple, set, frozenset)):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            stack.extend(current)
+            continue
+
+
+def _clear_runtime_memory_attr(module: Any) -> int:
+    """Drop a module.memory attribute when it contains runtime tensors."""
+    if not hasattr(module, 'memory'):
+        return 0
+
+    tensor_count = sum(1 for _ in _iter_runtime_tensors(getattr(module, 'memory', None)))
+    if tensor_count <= 0:
+        return 0
+
+    module.memory = None
+    return tensor_count
+
+
+def synchronize_model(model: Optional[torch.nn.Module],
+                      debug: Optional['Debug'] = None,
+                      reason: Optional[str] = None) -> int:
+    """Synchronize all non-CPU/non-meta devices touched by a model."""
+    if model is None:
+        return 0
+
+    devices = set()
+    try:
+        for tensor in model.parameters():
+            if tensor is None or not torch.is_tensor(tensor):
+                continue
+            device = tensor.device
+            if device.type not in ('cpu', 'meta'):
+                devices.add(str(device))
+
+        for tensor in model.buffers():
+            if tensor is None or not torch.is_tensor(tensor):
+                continue
+            device = tensor.device
+            if device.type not in ('cpu', 'meta'):
+                devices.add(str(device))
+
+        for module in model.modules():
+            for tensor in _iter_runtime_tensors(getattr(module, 'memory', None)):
+                device = tensor.device
+                if device.type not in ('cpu', 'meta'):
+                    devices.add(str(device))
+    except Exception as e:
+        if debug:
+            why = f" ({reason})" if reason else ""
+            debug.log(
+                f"Failed to inspect model devices{why}: {e}",
+                level="WARNING",
+                category="cleanup",
+                force=True,
+            )
+        return 0
+
+    synced = 0
+    for device_str in sorted(devices):
+        if synchronize_device(torch.device(device_str), debug=debug, reason=reason):
+            synced += 1
+    return synced
+
+
+def synchronize_visible_accelerators(debug: Optional['Debug'] = None,
+                                     reason: Optional[str] = None) -> int:
+    """Synchronize all visible accelerator devices before allocator/cache operations."""
+    synced = 0
+    if is_cuda_available():
+        for idx in range(torch.cuda.device_count()):
+            if synchronize_device(torch.device(f"cuda:{idx}"), debug=debug, reason=reason):
+                synced += 1
+    elif is_mps_available():
+        if synchronize_device(torch.device('mps'), debug=debug, reason=reason):
+            synced += 1
+    return synced
 
 
 def is_mps_available() -> bool:
@@ -291,7 +444,10 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
         debug.log(f"Clearing memory caches ({cleanup_mode})...", category="cleanup")
     
     # ===== MINIMAL OPERATIONS (Always performed) =====
-    # Step 1: Clear GPU caches - Fast operations (~1-5ms)
+    # Step 1: Synchronize devices before touching allocators / caches
+    synchronize_visible_accelerators(debug=debug, reason="before allocator cache clearing")
+
+    # Step 2: Clear GPU caches - Fast operations (~1-5ms)
     if debug:
         debug.start_timer(gpu_timer)
     
@@ -456,11 +612,8 @@ def clear_rope_lru_caches(model: Optional[torch.nn.Module], debug: Optional['Deb
 
 
 def release_tensor_memory(tensor: Optional[torch.Tensor]) -> None:
-    """Release tensor memory from any device (CPU/CUDA/MPS)"""
+    """Release tensor references without invalidating accelerator-backed storage."""
     if tensor is not None and torch.is_tensor(tensor):
-        # Release storage for all devices (CPU, CUDA, MPS)
-        if tensor.numel() > 0:
-            tensor.data.set_()
         tensor.grad = None
 
 
@@ -533,7 +686,7 @@ def cleanup_text_embeddings(ctx: Dict[str, Any], debug: Optional['Debug'] = None
             names.append(key)
     
     if embeddings:
-        release_text_embeddings(embeddings, names, debug)
+        release_text_embeddings(*embeddings, debug=debug, names=names)
         
         if debug:
             debug.log(f"Cleaned up text embeddings: {', '.join(names)}", category="cleanup")
@@ -543,38 +696,29 @@ def cleanup_text_embeddings(ctx: Dict[str, Any], debug: Optional['Debug'] = None
     
 def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debug'] = None) -> None:
     """
-    Release all GPU/MPS memory from model in-place without CPU transfer.
-    
-    Args:
-        model: PyTorch model to release memory from
-        debug: Optional debug instance for logging
+    Release model-owned references without force-invalidating accelerator storage.
     """
     if model is None:
         return
     
     try:
-        # Clear gradients first
+        synchronize_model(model=model, debug=debug, reason="before releasing model references")
         model.zero_grad(set_to_none=True)
-        
-        # Release GPU memory directly without CPU transfer
-        released_params = 0
-        released_buffers = 0
-        
-        for param in model.parameters():
-            if param.is_cuda or param.is_mps:
-                if param.numel() > 0:
-                    param.data.set_()
-                    released_params += 1
-                param.grad = None
-                
-        for buffer in model.buffers():
-            if buffer.is_cuda or buffer.is_mps:
-                if buffer.numel() > 0:
-                    buffer.data.set_()
-                    released_buffers += 1
-        
-        if debug and (released_params > 0 or released_buffers > 0):
-            debug.log(f"Released memory from {released_params} params and {released_buffers} buffers", category="success")
+
+        cleared_memory_buffers = 0
+        cleared_runtime_tensors = 0
+        for module in model.modules():
+            cleared_tensors = _clear_runtime_memory_attr(module)
+            if cleared_tensors > 0:
+                cleared_memory_buffers += 1
+                cleared_runtime_tensors += cleared_tensors
+
+        if debug:
+            debug.log(
+                f"Released model references and cleared {cleared_memory_buffers} runtime memory buffers "
+                f"({cleared_runtime_tensors} tensors)",
+                category="success",
+            )
                 
     except (AttributeError, RuntimeError) as e:
         if debug:
@@ -783,6 +927,8 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         if debug:
             debug.start_timer(timer_name)
         
+        synchronize_model(model=model, debug=debug, reason=f"before moving {model_name} to {_device_str(target_device)}")
+
         # Move entire model to target offload device
         model.to(target_device)
         model.zero_grad(set_to_none=True)
@@ -817,6 +963,8 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         if debug:
             debug.start_timer(timer_name)
         
+        synchronize_model(model=model, debug=debug, reason=f"before restoring {model_name} BlockSwap placement")
+
         # Restore blocks to their configured devices
         if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
             # Use configured offload_device from BlockSwap config
@@ -907,6 +1055,8 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     if debug:
         debug.start_timer(timer_name)
     
+    synchronize_model(model=model, debug=debug, reason=f"before moving {model_name} to {_device_str(target_device)}")
+
     # Move model and clear gradients
     model.to(target_device)
     model.zero_grad(set_to_none=True)
@@ -914,13 +1064,17 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     # Clear VAE memory buffers when moving to CPU
     if target_type == 'cpu' and model_name == "VAE":
         cleared_count = 0
+        cleared_tensor_count = 0
         for module in model.modules():
-            if hasattr(module, 'memory') and module.memory is not None:
-                if torch.is_tensor(module.memory) and (module.memory.is_cuda or module.memory.is_mps):
-                    module.memory = None
-                    cleared_count += 1
+            cleared_tensors = _clear_runtime_memory_attr(module)
+            if cleared_tensors > 0:
+                cleared_count += 1
+                cleared_tensor_count += cleared_tensors
         if cleared_count > 0 and debug:
-            debug.log(f"Cleared {cleared_count} VAE memory buffers", category="success")
+            debug.log(
+                f"Cleared {cleared_count} VAE memory buffers ({cleared_tensor_count} tensors)",
+                category="success",
+            )
     
     # End timer
     if debug:
@@ -1023,6 +1177,8 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
     
     if debug:
         debug.log("Cleaning up DiT components", category="cleanup")
+
+    synchronize_model(getattr(runner, 'dit', None), debug=debug, reason="before DiT cleanup")
     
     # 1. Clear DiT-specific runtime caches first
     if hasattr(runner, 'dit'):
@@ -1112,6 +1268,8 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
     
     if debug:
         debug.log("Cleaning up VAE components", category="cleanup")
+
+    synchronize_model(getattr(runner, 'vae', None), debug=debug, reason="before VAE cleanup")
     
     # 1. Clear VAE-specific temporary attributes
     if hasattr(runner, 'vae'):
