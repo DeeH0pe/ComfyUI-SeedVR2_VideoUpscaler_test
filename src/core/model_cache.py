@@ -121,7 +121,7 @@ class GlobalModelCache:
             if current_dit != dit_model or current_vae != vae_model:
                 return template, "mismatch"
 
-            setattr(template, '_seedvr2_execution_active', True)
+            template._seedvr2_execution_active = True
             return template, "claimed"
     
     def set_dit(self, dit_config: Dict[str, Any], model: Any, model_name: str, debug: Optional['Debug'] = None) -> Optional[str]:
