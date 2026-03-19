@@ -388,6 +388,39 @@ class GlobalModelCache:
         if debug:
             debug.log(f"Removed cached runner template: nodes {runner_key}", category="cache", force=True)
         return True
+
+    def taint_and_remove_runner(self,
+                                dit_id: Optional[int],
+                                vae_id: Optional[int],
+                                debug: Optional['Debug'] = None,
+                                expected_runner: Optional[Any] = None) -> bool:
+        """Atomically mark a cached runner template tainted/inactive and remove it."""
+        if dit_id is None or vae_id is None:
+            return False
+
+        runner_key = f"{dit_id}+{vae_id}"
+        with self._runner_templates_lock:
+            cached_runner = self._runner_templates.get(runner_key)
+            if cached_runner is None:
+                return False
+
+            if expected_runner is not None and cached_runner is not expected_runner:
+                if debug:
+                    debug.log(
+                        f"Skipped taint+remove for cached runner nodes {runner_key}: cache entry no longer matches expected runner",
+                        level="WARNING",
+                        category="cache",
+                        force=True,
+                    )
+                return False
+
+            cached_runner._seedvr2_runner_tainted = True
+            cached_runner._seedvr2_execution_active = False
+            del self._runner_templates[runner_key]
+
+        if debug:
+            debug.log(f"Tainted and removed cached runner template: nodes {runner_key}", category="cache", force=True)
+        return True
     
     def remove_dit(
         self,

@@ -1092,25 +1092,31 @@ def _process_frames_core(
         cleanup(dit_cache_flag=cache_dit, vae_cache_flag=cache_vae)
         return result_tensor
     except BaseException:
-        if runner is not None:
-            runner._seedvr2_runner_tainted = True
-
+        claimed_dit = cache_context.get('cached_dit') if cache_context is not None else None
+        claimed_vae = cache_context.get('cached_vae') if cache_context is not None else None
         if cache_context is not None:
             _evict_claimed_cached_models(cache_context, runner, debug)
-            try:
-                cache_context['global_cache'].remove_runner(
-                    cache_context.get('dit_id'),
-                    cache_context.get('vae_id'),
-                    debug,
-                    expected_runner=runner,
-                )
-            except BaseException:
-                pass
+            if runner is not None and cache_context.get('reusing_runner', False):
+                try:
+                    cache_context['global_cache'].taint_and_remove_runner(
+                        cache_context.get('dit_id'),
+                        cache_context.get('vae_id'),
+                        debug,
+                        expected_runner=runner,
+                    )
+                except BaseException:
+                    pass
 
         try:
-            cleanup(dit_cache_flag=False, vae_cache_flag=False)
-        except BaseException:
-            pass
+            try:
+                cleanup(dit_cache_flag=False, vae_cache_flag=False)
+            except BaseException:
+                pass
+        finally:
+            if claimed_dit is not None:
+                set_model_cache_claimed_state(claimed_dit, False)
+            if claimed_vae is not None:
+                set_model_cache_claimed_state(claimed_vae, False)
         raise
 
 

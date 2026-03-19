@@ -764,9 +764,7 @@ def _acquire_runner(
                 category="cache",
                 force=True,
             )
-            template._seedvr2_runner_tainted = True
-            template._seedvr2_execution_active = False
-            cache_context['global_cache'].remove_runner(
+            cache_context['global_cache'].taint_and_remove_runner(
                 cache_context['dit_id'],
                 cache_context['vae_id'],
                 debug,
@@ -949,10 +947,8 @@ def configure_runner(
     except BaseException:
         _evict_claimed_cached_models(cache_context, runner, debug)
         if runner is not None and cache_context.get('reusing_runner', False):
-            runner._seedvr2_runner_tainted = True
-            runner._seedvr2_execution_active = False
             try:
-                cache_context['global_cache'].remove_runner(
+                cache_context['global_cache'].taint_and_remove_runner(
                     cache_context.get('dit_id'),
                     cache_context.get('vae_id'),
                     debug,
@@ -1007,7 +1003,7 @@ def _finalize_claimed_cached_models_for_reuse(
     runner: Optional[VideoDiffusionInfer],
     debug: Optional['Debug'] = None,
 ) -> None:
-    """Refresh claimed cache entries to the post-cleanup released model objects."""
+    """Refresh or evict claimed cache entries using the released runner-held model refs."""
     if not cache_context or runner is None:
         return
 
