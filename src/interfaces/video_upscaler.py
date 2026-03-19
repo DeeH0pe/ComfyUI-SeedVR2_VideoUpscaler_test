@@ -23,7 +23,10 @@ from ..core.generation_utils import (
     load_text_embeddings,
     script_directory
 )
-from ..core.model_configuration import _evict_claimed_cached_models
+from ..core.model_configuration import (
+    _evict_claimed_cached_models,
+    _finalize_claimed_cached_models_for_reuse,
+)
 from ..optimization.memory_manager import (
     cleanup_text_embeddings,
     complete_cleanup,
@@ -322,18 +325,35 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             # Use complete_cleanup for all cleanup operations
             if runner:
+                claimed_dit = cache_context.get('cached_dit') if cache_context is not None else None
+                claimed_vae = cache_context.get('cached_vae') if cache_context is not None else None
                 try:
-                    complete_cleanup(
-                        runner=runner,
-                        debug=debug,
-                        dit_cache=dit_cache,
-                        vae_cache=vae_cache,
-                    )
-                    if dit_cache and getattr(runner, 'dit', None) is not None:
-                        set_model_cache_claimed_state(runner.dit, False)
-                    if vae_cache and getattr(runner, 'vae', None) is not None:
-                        set_model_cache_claimed_state(runner.vae, False)
+                    try:
+                        complete_cleanup(
+                            runner=runner,
+                            debug=debug,
+                            dit_cache=dit_cache,
+                            vae_cache=vae_cache,
+                        )
+                        if dit_cache or vae_cache:
+                            _finalize_claimed_cached_models_for_reuse(cache_context, runner, debug)
+                    except Exception:
+                        try:
+                            _evict_claimed_cached_models(cache_context, runner, debug)
+                        except Exception as evict_error:
+                            if debug is not None:
+                                debug.log(
+                                    f"Failed to evict claimed cached models while handling prior cleanup/finalize exception: {evict_error}",
+                                    level="WARNING",
+                                    category="cleanup",
+                                    force=True,
+                                )
+                        raise
                 finally:
+                    if dit_cache and claimed_dit is not None:
+                        set_model_cache_claimed_state(claimed_dit, False)
+                    if vae_cache and claimed_vae is not None:
+                        set_model_cache_claimed_state(claimed_vae, False)
                     runner._seedvr2_execution_active = False
                 
                 # Delete runner only if neither model is cached

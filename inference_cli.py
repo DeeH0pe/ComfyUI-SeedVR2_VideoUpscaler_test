@@ -130,7 +130,10 @@ from src.core.generation_phases import (
     decode_all_batches, 
     postprocess_all_batches
 )
-from src.core.model_configuration import _evict_claimed_cached_models
+from src.core.model_configuration import (
+    _evict_claimed_cached_models,
+    _finalize_claimed_cached_models_for_reuse,
+)
 from src.utils.debug import Debug
 from src.optimization.memory_manager import (
     cleanup_text_embeddings,
@@ -928,18 +931,35 @@ def _process_frames_core(
         nonlocal runner, ctx
 
         if runner is not None:
+            claimed_dit = cache_context.get('cached_dit') if cache_context is not None else None
+            claimed_vae = cache_context.get('cached_vae') if cache_context is not None else None
             try:
-                complete_cleanup(
-                    runner=runner,
-                    debug=debug,
-                    dit_cache=dit_cache_flag,
-                    vae_cache=vae_cache_flag,
-                )
-                if dit_cache_flag and getattr(runner, 'dit', None) is not None:
-                    set_model_cache_claimed_state(runner.dit, False)
-                if vae_cache_flag and getattr(runner, 'vae', None) is not None:
-                    set_model_cache_claimed_state(runner.vae, False)
+                try:
+                    complete_cleanup(
+                        runner=runner,
+                        debug=debug,
+                        dit_cache=dit_cache_flag,
+                        vae_cache=vae_cache_flag,
+                    )
+                    if dit_cache_flag or vae_cache_flag:
+                        _finalize_claimed_cached_models_for_reuse(cache_context, runner, debug)
+                except Exception:
+                    try:
+                        _evict_claimed_cached_models(cache_context, runner, debug)
+                    except Exception as evict_error:
+                        if debug is not None:
+                            debug.log(
+                                f"Failed to evict claimed cached models while handling prior cleanup/finalize exception: {evict_error}",
+                                level="WARNING",
+                                category="cleanup",
+                                force=True,
+                            )
+                    raise
             finally:
+                if dit_cache_flag and claimed_dit is not None:
+                    set_model_cache_claimed_state(claimed_dit, False)
+                if vae_cache_flag and claimed_vae is not None:
+                    set_model_cache_claimed_state(claimed_vae, False)
                 runner._seedvr2_execution_active = False
 
             if not (dit_cache_flag or vae_cache_flag):
