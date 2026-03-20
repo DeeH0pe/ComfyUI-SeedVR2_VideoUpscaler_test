@@ -105,11 +105,14 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
     existing_transform = ctx.get('video_transform')
     
     if existing_transform is not None:
+        debug.log("SeedVR2 breadcrumb: setup_video_transform using existing transform", category="setup", force=True) if debug else None
         # Transform exists - check if we need to compute dimensions
         if 'true_target_dims' in ctx and sample_frame is not None:
             # Return cached dimensions + recompute padded from sample
+            debug.log("SeedVR2 breadcrumb: before existing_transform(sample_frame)", category="setup", force=True) if debug else None
             true_h, true_w = ctx['true_target_dims']
             transformed = existing_transform(sample_frame)
+            debug.log("SeedVR2 breadcrumb: after existing_transform(sample_frame)", category="setup", force=True) if debug else None
             padded_h, padded_w = transformed.shape[-2:]
             if debug:
                 debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
@@ -119,6 +122,7 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
         return 0, 0, 0, 0
     
     # Create transformation pipeline (first time or after cleanup)
+    debug.log("SeedVR2 breadcrumb: setup_video_transform creating new transform", category="setup", force=True) if debug else None
     ctx['video_transform'] = prepare_video_transforms(resolution, max_resolution, debug)
     
     # Compute dimensions if sample frame provided
@@ -128,7 +132,9 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
             NaResize(resolution=resolution, mode="side", downsample_only=False, max_resolution=max_resolution),
             Lambda(lambda x: torch.clamp(x, 0.0, 1.0))
         ])
+        debug.log("SeedVR2 breadcrumb: before temp_transform(sample_frame)", category="setup", force=True) if debug else None
         resized_sample = temp_transform(sample_frame)
+        debug.log("SeedVR2 breadcrumb: after temp_transform(sample_frame)", category="setup", force=True) if debug else None
         true_h, true_w = resized_sample.shape[-2:]
         
         # Round to even numbers for video codec compatibility (libx264 requirement)
@@ -139,7 +145,9 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
         ctx['true_target_dims'] = (true_h, true_w)
         
         # Get padded dimensions
+        debug.log("SeedVR2 breadcrumb: before ctx['video_transform'](sample_frame)", category="setup", force=True) if debug else None
         transformed_sample = ctx['video_transform'](sample_frame)
+        debug.log("SeedVR2 breadcrumb: after ctx['video_transform'](sample_frame)", category="setup", force=True) if debug else None
         padded_h, padded_w = transformed_sample.shape[-2:]
         
         if debug:
@@ -194,18 +202,23 @@ def compute_generation_info(
     channels_info = "RGBA" if images.shape[-1] == 4 else "RGB"
     
     # Apply prepending if requested
+    debug.log("SeedVR2 breadcrumb: compute_generation_info before temporal prepend", category="generation", force=True) if debug else None
     if prepend_frames > 0:
         images = pad_video_temporal(images, count=prepend_frames, temporal_dim=0, prepend=True, debug=debug)
+    debug.log("SeedVR2 breadcrumb: compute_generation_info after temporal prepend", category="generation", force=True) if debug else None
     
     # Track total frames after prepending
     total_frames = len(images)
     ctx['total_frames'] = total_frames
     
     # Setup transform and compute dimensions on final frame count
+    debug.log("SeedVR2 breadcrumb: compute_generation_info before sample_frame", category="generation", force=True) if debug else None
     sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
+    debug.log("SeedVR2 breadcrumb: compute_generation_info before setup_video_transform", category="generation", force=True) if debug else None
     true_h, true_w, padded_h, padded_w = setup_video_transform(
         ctx, resolution, max_resolution, debug, sample_frame
     )
+    debug.log("SeedVR2 breadcrumb: compute_generation_info after setup_video_transform", category="generation", force=True) if debug else None
     del sample_frame
     
     info = {
