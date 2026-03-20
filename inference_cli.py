@@ -933,6 +933,8 @@ def _process_frames_core(
         if runner is not None:
             claimed_dit = cache_context.get('cached_dit') if cache_context is not None else None
             claimed_vae = cache_context.get('cached_vae') if cache_context is not None else None
+            refreshed_dit = None
+            refreshed_vae = None
             try:
                 try:
                     complete_cleanup(
@@ -942,7 +944,7 @@ def _process_frames_core(
                         vae_cache=vae_cache_flag,
                     )
                     if dit_cache_flag or vae_cache_flag:
-                        _finalize_claimed_cached_models_for_reuse(cache_context, runner, debug)
+                        refreshed_dit, refreshed_vae = _finalize_claimed_cached_models_for_reuse(cache_context, runner, debug)
                 except Exception:
                     try:
                         _evict_claimed_cached_models(cache_context, runner, debug)
@@ -958,8 +960,12 @@ def _process_frames_core(
             finally:
                 if dit_cache_flag and claimed_dit is not None:
                     set_model_cache_claimed_state(claimed_dit, False)
+                if dit_cache_flag and refreshed_dit is not None and refreshed_dit is not claimed_dit:
+                    set_model_cache_claimed_state(refreshed_dit, False)
                 if vae_cache_flag and claimed_vae is not None:
                     set_model_cache_claimed_state(claimed_vae, False)
+                if vae_cache_flag and refreshed_vae is not None and refreshed_vae is not claimed_vae:
+                    set_model_cache_claimed_state(refreshed_vae, False)
                 runner._seedvr2_execution_active = False
 
             if not (dit_cache_flag or vae_cache_flag):
@@ -1104,14 +1110,28 @@ def _process_frames_core(
                         debug,
                         expected_runner=runner,
                     )
-                except BaseException:
-                    pass
+                except BaseException as cache_error:
+                    if debug is not None:
+                        debug.log(
+                            f"Failed to evict cached runner while handling prior exception "
+                            f"(runner={id(runner)}, dit_id={cache_context.get('dit_id')}, vae_id={cache_context.get('vae_id')}): {cache_error}",
+                            level="WARNING",
+                            category="cleanup",
+                            force=True,
+                        )
 
         try:
             try:
                 cleanup(dit_cache_flag=False, vae_cache_flag=False)
-            except BaseException:
-                pass
+            except BaseException as cleanup_error:
+                if debug is not None:
+                    debug.log(
+                        f"Cleanup failed while handling prior exception "
+                        f"(runner={id(runner) if runner is not None else 'none'}, dit_id={cache_context.get('dit_id') if cache_context is not None else 'none'}, vae_id={cache_context.get('vae_id') if cache_context is not None else 'none'}): {cleanup_error}",
+                        level="WARNING",
+                        category="cleanup",
+                        force=True,
+                    )
         finally:
             if claimed_dit is not None:
                 set_model_cache_claimed_state(claimed_dit, False)

@@ -327,6 +327,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             if runner:
                 claimed_dit = cache_context.get('cached_dit') if cache_context is not None else None
                 claimed_vae = cache_context.get('cached_vae') if cache_context is not None else None
+                refreshed_dit = None
+                refreshed_vae = None
                 try:
                     try:
                         complete_cleanup(
@@ -336,7 +338,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                             vae_cache=vae_cache,
                         )
                         if dit_cache or vae_cache:
-                            _finalize_claimed_cached_models_for_reuse(cache_context, runner, debug)
+                            refreshed_dit, refreshed_vae = _finalize_claimed_cached_models_for_reuse(cache_context, runner, debug)
                     except Exception:
                         try:
                             _evict_claimed_cached_models(cache_context, runner, debug)
@@ -352,8 +354,12 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 finally:
                     if dit_cache and claimed_dit is not None:
                         set_model_cache_claimed_state(claimed_dit, False)
+                    if dit_cache and refreshed_dit is not None and refreshed_dit is not claimed_dit:
+                        set_model_cache_claimed_state(refreshed_dit, False)
                     if vae_cache and claimed_vae is not None:
                         set_model_cache_claimed_state(claimed_vae, False)
+                    if vae_cache and refreshed_vae is not None and refreshed_vae is not claimed_vae:
+                        set_model_cache_claimed_state(refreshed_vae, False)
                     runner._seedvr2_execution_active = False
                 
                 # Delete runner only if neither model is cached

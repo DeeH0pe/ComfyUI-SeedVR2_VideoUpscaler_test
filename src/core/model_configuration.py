@@ -1002,14 +1002,17 @@ def _finalize_claimed_cached_models_for_reuse(
     cache_context: Dict[str, Any],
     runner: Optional[VideoDiffusionInfer],
     debug: Optional['Debug'] = None,
-) -> None:
+) -> Tuple[Optional[Any], Optional[Any]]:
     """Refresh or evict claimed cache entries using the released runner-held model refs."""
+    refreshed_dit = None
+    refreshed_vae = None
+
     if not cache_context or runner is None:
-        return
+        return refreshed_dit, refreshed_vae
 
     global_cache = cache_context.get('global_cache')
     if global_cache is None:
-        return
+        return refreshed_dit, refreshed_vae
 
     claimed_dit = cache_context.get('cached_dit')
     claimed_vae = cache_context.get('cached_vae')
@@ -1019,6 +1022,7 @@ def _finalize_claimed_cached_models_for_reuse(
         released_dit = getattr(runner, 'dit', None)
         if released_dit is not None:
             if global_cache.replace_dit({'node_id': dit_id}, released_dit, debug, expected_model=claimed_dit):
+                refreshed_dit = released_dit
                 runner.dit = released_dit
             else:
                 global_cache.remove_dit({'node_id': dit_id}, debug, expected_model=claimed_dit)
@@ -1032,6 +1036,7 @@ def _finalize_claimed_cached_models_for_reuse(
         released_vae = getattr(runner, 'vae', None)
         if released_vae is not None:
             if global_cache.replace_vae({'node_id': vae_id}, released_vae, debug, expected_model=claimed_vae):
+                refreshed_vae = released_vae
                 runner.vae = released_vae
             else:
                 global_cache.remove_vae({'node_id': vae_id}, debug, expected_model=claimed_vae)
@@ -1039,6 +1044,8 @@ def _finalize_claimed_cached_models_for_reuse(
         else:
             global_cache.remove_vae({'node_id': vae_id}, debug, expected_model=claimed_vae)
             runner.vae = None
+
+    return refreshed_dit, refreshed_vae
 
 
 def _configure_runner_settings(
