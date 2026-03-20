@@ -318,11 +318,13 @@ def encode_all_batches(
         # Cache VAE now that it's fully configured and ready for inference
         if ctx['cache_context']['vae_cache'] and not ctx['cache_context']['cached_vae']:
             runner.vae._model_name = ctx['cache_context']['vae_model']
-            ctx['cache_context']['global_cache'].set_vae(
+            cached_vae_id = ctx['cache_context']['global_cache'].set_vae(
                 {'node_id': ctx['cache_context']['vae_id'], 'cache_model': True}, 
                 runner.vae, ctx['cache_context']['vae_model'], debug
             )
-            ctx['cache_context']['vae_newly_cached'] = True
+            if cached_vae_id is not None:
+                ctx['cache_context']['vae_newly_cached'] = True
+                ctx['cache_context']['cached_vae'] = runner.vae
             
             # If both models now cached, cache runner template
             dit_is_cached = ctx['cache_context']['cached_dit'] or ctx['cache_context']['dit_newly_cached']
@@ -648,11 +650,13 @@ def upscale_all_batches(
         # Cache DiT now that it's fully configured and ready for inference
         if ctx['cache_context']['dit_cache'] and not ctx['cache_context']['cached_dit']:
             runner.dit._model_name = ctx['cache_context']['dit_model']
-            ctx['cache_context']['global_cache'].set_dit(
+            cached_dit_id = ctx['cache_context']['global_cache'].set_dit(
                 {'node_id': ctx['cache_context']['dit_id'], 'cache_model': True}, 
                 runner.dit, ctx['cache_context']['dit_model'], debug
             )
-            ctx['cache_context']['dit_newly_cached'] = True
+            if cached_dit_id is not None:
+                ctx['cache_context']['dit_newly_cached'] = True
+                ctx['cache_context']['cached_dit'] = runner.dit
             
             # If both models now cached, cache runner template
             vae_is_cached = ctx['cache_context']['cached_vae'] or ctx['cache_context']['vae_newly_cached']
